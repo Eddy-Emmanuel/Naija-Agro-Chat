@@ -28,6 +28,9 @@ class Config:
     # For quick local testing swap to: "HuggingFaceH4/zephyr-7b-beta"
     GENERATOR_MODEL: str = "CohereForAI/aya-23-8B"
 
+    MAX_NEW_TOKENS: int = 512       # tokens produced by the model
+    MAX_TOTAL_TOKENS: int = 1024    # includes the prompt length
+
     # Safety layer
     OPENAI_SAFETY_MODEL: str = "gpt-4o-mini"      # cheap & fast for safety checks
     SAFETY_KEYWORDS: list[str] = [

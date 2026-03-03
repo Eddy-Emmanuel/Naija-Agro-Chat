@@ -2,7 +2,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough, RunnableLambda
 from langchain_openai import ChatOpenAI
 
 from .config import Config, logger
@@ -14,7 +13,6 @@ from app.agent.stt import Speech2Text
 from app.agent.tts import Text2Speech
 
 
-# messages for abstention / no context
 ABSTENTION_MESSAGE = (
     "⚠️  This question requires verification from an extension officer. "
     "The information I retrieved does not fully support a safe answer. "
@@ -27,6 +25,17 @@ NO_CONTEXT_MESSAGE = (
     "Please consult your local agricultural extension officer."
 )
 
+# Per-language voice mapping for Spitch TTS
+# "sade" is English-only; use language-appropriate voices for others
+LANG_VOICE_MAP = {
+    "en": "sade",
+    "yo": "tunde",   # Yoruba voice — update to actual Spitch voice name for yo
+    "ha": "tunde",   # Hausa
+    "ig": "tunde",   # Igbo
+    "pcm": "tunde",  # Nigerian Pidgin
+}
+DEFAULT_VOICE = "tunde"
+
 
 class NaijaAgroChat:
     """
@@ -38,27 +47,10 @@ class NaijaAgroChat:
         print(response["answer"])
     """
 
-    def __init__(
-        self,
-        retriever,
-        generator_llm,
-        safety_llm: ChatOpenAI,
-    ):
+    def __init__(self, retriever, generator_llm, safety_llm: ChatOpenAI):
         self.retriever = retriever
         self.generator_llm = generator_llm
         self.safety_llm = safety_llm
-
-        # Core RAG chain (LCEL)
-        self._rag_chain = (
-            RunnablePassthrough.assign(
-                context=RunnableLambda(
-                    lambda x: format_docs(self.retriever.invoke(x["question"]))
-                )
-            )
-            | generation_prompt
-            | self.generator_llm
-            | StrOutputParser()
-        )
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -77,7 +69,7 @@ class NaijaAgroChat:
         """
         logger.info(f"Query: {query}")
 
-        # 1. Retrieve context
+        # 1. Retrieve context ONCE
         retrieved_docs = self.retriever.invoke(query)
         context_str = format_docs(retrieved_docs)
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
@@ -92,8 +84,16 @@ class NaijaAgroChat:
                 "safe": None,
             }
 
-        # 2. Generate answer
-        answer = self._rag_chain.invoke({"question": query})
+        # 2. Generate — pass pre-retrieved context directly, no second retrieval
+        try:
+            answer = (
+                generation_prompt
+                | self.generator_llm
+                | StrOutputParser()
+            ).invoke({"question": query, "context": context_str})
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            raise
 
         # 3. Safety check (only for safety-critical queries)
         safety_checked = False
@@ -103,7 +103,6 @@ class NaijaAgroChat:
             safety_checked = True
             is_safe, reason = verify_safety(query, answer, context_str, self.safety_llm)
             logger.info(f"Safety check — safe={is_safe}, reason={reason}")
-
             if not is_safe:
                 answer = ABSTENTION_MESSAGE
 
@@ -115,12 +114,14 @@ class NaijaAgroChat:
             "safe": is_safe,
         }
 
-    # ── convenience helpers for audio ----------------------------------------
+    # ── audio helpers ─────────────────────────────────────────────────────────
 
     def ask_audio(self, audio_file: str, lang: str = "en") -> Tuple[dict, object]:
-        """Transcribe audio, run a query, and produce speech output.
+        """Transcribe audio → RAG query → TTS response.
 
-        Returns a tuple of (result_dict, audio_segment).
+        Returns (result_dict, audio_segment).
+        NOTE: STT, RAG, and TTS are deliberately left as separate steps so
+        the Streamlit frontend can wrap each in its own spinner/error block.
         """
         text = Speech2Text(audio_file, lang)
         result = self.ask(text)
@@ -131,7 +132,7 @@ class NaijaAgroChat:
         """Generate speech from plain text."""
         return Text2Speech(text, lang)
 
-    # ── factory --------------------------------------------------------------
+    # ── factory ───────────────────────────────────────────────────────────────
 
     @classmethod
     def build(
@@ -141,19 +142,7 @@ class NaijaAgroChat:
         openai_api_key: Optional[str] = None,
         use_openai_generator: bool = False,
     ) -> "NaijaAgroChat":
-        """
-        Build the full pipeline.
 
-        Args:
-            docs_dir: Path to folder with agricultural PDFs/TXTs.
-                      Defaults to Config.DOCS_DIR.
-            force_rebuild_index: Rebuild FAISS even if a saved index exists.
-            openai_api_key: OpenAI key for the safety layer (and optionally
-                            the generator). Falls back to OPENAI_API_KEY env var.
-            use_openai_generator: If True, use GPT-4o-mini as the generator
-                                  instead of the local Aya model (useful for
-                                  quick testing without a GPU).
-        """
         docs_dir = docs_dir or Config.DOCS_DIR
 
         # ── Vector store ──────────────────────────────────────────────────────
@@ -165,40 +154,44 @@ class NaijaAgroChat:
             chunks = chunk_documents(documents) if documents else []
             if not chunks:
                 logger.warning(
-                    "No documents found.  Building an empty index. "
-                    "Add PDFs to '%s' and rebuild.",
-                    docs_dir,
+                    "No documents found. Building an empty index. "
+                    "Add PDFs to '%s' and rebuild.", docs_dir,
                 )
-                # Create a minimal placeholder so the pipeline still runs
                 from langchain_core.documents import Document as _Doc
-
-                placeholder = _Doc(
+                chunks = [_Doc(
                     page_content="No agricultural documents loaded yet.",
                     metadata={"source": "placeholder"},
-                )
-                chunks = [placeholder]
+                )]
             vectorstore = build_or_load_vectorstore(chunks, force_rebuild=True)
 
         # ── Retriever ─────────────────────────────────────────────────────────
         retriever = build_retriever(vectorstore)
 
         # ── Generator ─────────────────────────────────────────────────────────
+        from app.config.settings import dot_env_pth
+        import os
+
+        # Resolve key once — never pass None to ChatOpenAI
+        # (passing None triggers an async callable bug in langchain-openai)
+        os.environ["OPENAI_API_KEY"] = dot_env_pth.OPENAI_API_KEY
+
         if use_openai_generator:
             logger.info("Using OpenAI GPT-4o-mini as generator.")
             generator_llm = ChatOpenAI(
                 model="gpt-4o-mini",
                 temperature=0.1,
-                api_key=openai_api_key,
+                api_key=dot_env_pth.OPENAI_API_KEY,
             )
         else:
             logger.info(f"Loading local generator: {Config.GENERATOR_MODEL}")
-            
             from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+            from transformers import logging as hf_logging
+            hf_logging.set_verbosity_error()
             import torch
-            from app.config.settings import dot_env_pth
-   
-            tokenizer = AutoTokenizer.from_pretrained(Config.GENERATOR_MODEL, 
-                                                      token=dot_env_pth.HUGGINGFACE_API_KEY)
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                Config.GENERATOR_MODEL, token=dot_env_pth.HUGGINGFACE_API_KEY
+            )
             model = AutoModelForCausalLM.from_pretrained(
                 Config.GENERATOR_MODEL,
                 token=dot_env_pth.HUGGINGFACE_API_KEY,
@@ -209,20 +202,18 @@ class NaijaAgroChat:
                 "text-generation",
                 model=model,
                 tokenizer=tokenizer,
-                max_new_tokens=512,
+                max_new_tokens=Config.MAX_NEW_TOKENS,
+                max_length=Config.MAX_TOTAL_TOKENS,
                 do_sample=False,
             )
             from langchain_huggingface import HuggingFacePipeline
-
             generator_llm = HuggingFacePipeline(pipeline=pipe)
 
-        # ── Safety LLM (OpenAI) ───────────────────────────────────────────────
-        import os
-        os.environ["OPENAI_API_KEY"] = dot_env_pth.OPENAI_API_KEY 
+        # ── Safety LLM ────────────────────────────────────────────────────────
         safety_llm = ChatOpenAI(
             model=Config.OPENAI_SAFETY_MODEL,
             temperature=0,
-            api_key=openai_api_key,
+            api_key=dot_env_pth.OPENAI_API_KEY,
         )
 
         logger.info("NaijaAgroChat pipeline ready.")
