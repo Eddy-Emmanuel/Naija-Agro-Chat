@@ -1,0 +1,12 @@
+langchain==1.2.10
+elevenlabs==2.37.0
+pydantic==2.12.5
+langchain-community==0.4.1
+pydantic-settings==2.13.1
+langchain-openai==1.1.10
+
+# audio / UI
+streamlit
+pydub
+spitch
+
