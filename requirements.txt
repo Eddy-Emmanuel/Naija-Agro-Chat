@@ -4,6 +4,7 @@ pydantic==2.12.5
 langchain-community==0.4.1
 pydantic-settings==2.13.1
 langchain-openai==1.1.10
+langchain-huggingface==1.2.1
 langdetect==1.0.9
 
 # audio / UI
