@@ -72,7 +72,7 @@ def build_or_load_vectorstore(
 
     embeddings = HuggingFaceEmbeddings(
         model_name=Config.EMBEDDING_MODEL,
-        model_kwargs={"device": "cpu"},          # change to "cuda" if available
+        model_kwargs={"device": "cuda"},          # change to "cuda" if available
         encode_kwargs={"normalize_embeddings": True},
     )
 
