@@ -7,7 +7,7 @@ langchain-openai==1.1.10
 langchain-huggingface==1.2.1
 langdetect==1.0.9
 sentence-transformers==5.2.3
-faiss-gpu==1.13.2
+faiss-cpu==1.13.2
 
 # audio / UI
 streamlit==1.54.0
