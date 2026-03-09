@@ -11,54 +11,44 @@ SerpAPI docs: https://serpapi.com/
 
 from __future__ import annotations
 
-import json
 import os
 from typing import Dict, List, Optional
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
-
-
-SERPAPI_SEARCH_URL = "https://serpapi.com/search.json"
-
+from langchain_community.utilities import SerpAPIWrapper, WikipediaAPIWrapper
 
 def web_search(query: str, num_results: int = 5, api_key: Optional[str] = None) -> List[Dict]:
     """Perform a web search and return a list of result dicts.
 
     Returns a list of dicts with keys: title, snippet, link.
+
+    Uses LangChain utilities:
+      • SerpAPIWrapper when SERPAPI_API_KEY is set
+      • WikipediaAPIWrapper as a fallback when no key is available.
     """
 
     api_key = api_key or os.getenv("SERPAPI_API_KEY")
-    if not api_key:
-        raise ValueError("SERPAPI_API_KEY is not set in the environment")
 
-    params = {
-        "q": query,
-        "api_key": api_key,
-        "engine": "google",
-        "num": num_results,
-    }
+    if api_key:
+        serp = SerpAPIWrapper(serpapi_api_key=api_key)
+        raw = serp.run(query)
 
-    url = f"{SERPAPI_SEARCH_URL}?{urlencode(params)}"
-    req = Request(url, headers={"User-Agent": "NaijaAgroChat/1.0"})
+        # SerpAPIWrapper returns a single text string; we split it into results.
+        # This is a heuristic but works well for short snippets.
+        items = [item.strip() for item in raw.split("\n") if item.strip()]
+        results = [
+            {"title": f"Result {i+1}", "snippet": item, "link": ""}
+            for i, item in enumerate(items[:num_results])
+        ]
+        return results
 
-    try:
-        with urlopen(req, timeout=10) as resp:
-            data = json.load(resp)
-    except (HTTPError, URLError) as e:
-        raise RuntimeError(f"Web search request failed: {e}")
-
-    results = []
-    for item in data.get("organic_results", [])[:num_results]:
-        results.append(
-            {
-                "title": item.get("title", ""),
-                "snippet": item.get("snippet", ""),
-                "link": item.get("link", ""),
-            }
+    # Fallback: use Wikipedia's summary endpoint
+    wiki = WikipediaAPIWrapper().run(query)
+    if not wiki:
+        raise ValueError(
+            "No SERPAPI_API_KEY found and Wikipedia fallback failed. "
+            "Set SERPAPI_API_KEY in the environment to enable web search."
         )
 
-    return results
+    return [{"title": query, "snippet": wiki, "link": "https://en.wikipedia.org/wiki/" + query.replace(' ', '_')}]
 
 
 def format_search_results(results: List[Dict]) -> str:

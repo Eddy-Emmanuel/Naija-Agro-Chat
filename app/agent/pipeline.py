@@ -30,7 +30,6 @@ def detect_language(text: str) -> str:
 
     Falls back to English if detection fails or returns an unsupported code.
     """
-
     try:
         lang = detect(text)
     except Exception:
@@ -58,17 +57,21 @@ NO_CONTEXT_MESSAGE = (
 # "sade" is English-only; use language-appropriate voices for others
 LANG_VOICE_MAP = {
     "en": "sade",
-    "yo": "tunde",   # Yoruba voice — update to actual Spitch voice name for yo
+    "yo": "tunde",   # Yoruba voice
     "ha": "tunde",   # Hausa
     "ig": "tunde",   # Igbo
     "pcm": "tunde",  # Nigerian Pidgin
 }
 DEFAULT_VOICE = "tunde"
 
+# ── Agent / tool imports ──────────────────────────────────────────────────────
+from langchain_core.tools import Tool                                  
+from langchain_classic.agents.agent_types import AgentType
+from langchain_classic.agents.initialize import initialize_agent
+
 
 class NaijaAgroChat:
-    """
-    Full NaijaAgroChat pipeline.
+    """Full NaijaAgroChat pipeline.
 
     Usage:
         bot = NaijaAgroChat.build()
@@ -82,11 +85,14 @@ class NaijaAgroChat:
         generator_llm,
         safety_llm: ChatOpenAI,
         translator_llm: ChatOpenAI,
+        agent_executor=None,
     ):
         self.retriever = retriever
         self.generator_llm = generator_llm
         self.safety_llm = safety_llm
         self.translator_llm = translator_llm
+        self.agent_executor = agent_executor
+        self._last_tool_output: str = ""
 
     # ── public API ─────────────────────────────────────────────────────────────
 
@@ -100,12 +106,14 @@ class NaijaAgroChat:
                 "sources": List[str],
                 "safety_checked": bool,
                 "safe": bool | None,
+                "lang": str,
             }
         """
         logger.info(f"Query: {query}")
         detected_lang = detect_language(query)
 
-        # 0. Translate non-English queries to English for retrieval (documents are primarily English)
+        # 0. Translate non-English queries to English for retrieval
+        #    (documents are primarily English)
         query_for_retrieval, translated = self._translate_query_for_retrieval(query)
 
         # 1. Retrieve context ONCE
@@ -113,10 +121,17 @@ class NaijaAgroChat:
         context_str = format_docs(retrieved_docs)
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
 
-        if not retrieved_docs:
+        # If the index is empty, the build step may insert a placeholder doc.
+        # Treat that as "no context" so web search can act as a fallback.
+        no_docs = (
+            not retrieved_docs
+            or all(d.metadata.get("source") == "placeholder" for d in retrieved_docs)
+            or ("No agricultural documents" in context_str)
+        )
+
+        if no_docs:
             logger.warning("No documents retrieved — trying web search fallback.")
 
-            # If the knowledge base has nothing, optionally fall back to live web search.
             if Config.USE_WEB_SEARCH:
                 try:
                     web_results = web_search(
@@ -131,10 +146,9 @@ class NaijaAgroChat:
                     sources = [r.get("link", "unknown") for r in web_results]
 
             if not context_str:
-                # Still no useful context – respond with a safe fallback message.
+                # Still no useful context — respond with a safe fallback message.
                 message = NO_CONTEXT_MESSAGE
                 if translated:
-                    # Return the fallback message in the same language as the query.
                     message = self._localize_message_for_query(message, query)
                 return {
                     "query": query,
@@ -145,16 +159,24 @@ class NaijaAgroChat:
                     "lang": detected_lang,
                 }
 
-        # 2. Generate — pass pre-retrieved context directly, no second retrieval
-        try:
-            answer = (
-                generation_prompt
-                | self.generator_llm
-                | StrOutputParser()
-            ).invoke({"question": query, "context": context_str})
-        except Exception as e:
-            logger.error(f"Generation failed: {e}")
-            raise
+        # If we have an agent_executor (tool-based agent), let it handle
+        # retrieval + generation.
+        if self.agent_executor:
+            logger.info("Using agent executor for query.")
+            answer = self.agent_executor.run(query)
+            context_for_safety = ""  # agent tools are opaque here
+        else:
+            # 2. Generate — pass pre-retrieved context directly
+            try:
+                answer = (
+                    generation_prompt
+                    | self.generator_llm
+                    | StrOutputParser()
+                ).invoke({"question": query, "context": context_str})
+            except Exception as e:
+                logger.error(f"Generation failed: {e}")
+                raise
+            context_for_safety = context_str
 
         # 3. Safety check (only for safety-critical queries)
         safety_checked = False
@@ -162,7 +184,7 @@ class NaijaAgroChat:
 
         if is_safety_critical(query):
             safety_checked = True
-            is_safe, reason = verify_safety(query, answer, context_str, self.safety_llm)
+            is_safe, reason = verify_safety(query, answer, context_for_safety, self.safety_llm)
             logger.info(f"Safety check — safe={is_safe}, reason={reason}")
             if not is_safe:
                 answer = ABSTENTION_MESSAGE
@@ -217,23 +239,22 @@ class NaijaAgroChat:
 
     # ── audio helpers ─────────────────────────────────────────────────────────
 
-    def ask_audio(self, audio_file: str, lang: str = "auto") -> Tuple[dict, object]:
-        """Transcribe audio → RAG query → TTS response.
+    def ask_audio(self, audio_file: str, lang: str = "auto") -> Tuple[dict, None]:
+        """Transcribe audio → RAG query.
 
-        Returns (result_dict, audio_segment).
-        NOTE: STT, RAG, and TTS are deliberately left as separate steps so
-        the Streamlit frontend can wrap each in its own spinner/error block.
+        Returns (result_dict, None).
+        TTS is handled separately by the caller (app.py) via text_to_speech().
+        STT, RAG, and TTS are kept as separate steps so the Streamlit frontend
+        can wrap each in its own spinner/error block.
         """
         # Spitch requires a language code; if user requested auto-detection,
         # transcribe with English and then detect the actual language from text.
         stt_lang = "en" if lang == "auto" else lang
         text = Speech2Text(audio_file, stt_lang)
         result = self.ask(text)
-
-        # If we autodetected, use detected language for TTS
-        tts_lang = result.get("lang", lang)
-        audio = Text2Speech(result["answer"], tts_lang)
-        return result, audio
+        # TTS is intentionally NOT called here — app.py calls text_to_speech()
+        # separately to avoid a double TTS round-trip.
+        return result, None
 
     def text_to_speech(self, text: str, lang: str = "auto"):
         """Generate speech from plain text."""
@@ -250,6 +271,7 @@ class NaijaAgroChat:
         force_rebuild_index: bool = False,
         openai_api_key: Optional[str] = None,
         use_openai_generator: bool = False,
+        use_agent: bool = False,
     ) -> "NaijaAgroChat":
 
         docs_dir = docs_dir or Config.DOCS_DIR
@@ -281,7 +303,6 @@ class NaijaAgroChat:
         import os
 
         # Resolve key once — never pass None to ChatOpenAI
-        # (passing None triggers an async callable bug in langchain-openai)
         os.environ["OPENAI_API_KEY"] = dot_env_pth.OPENAI_API_KEY
 
         if use_openai_generator:
@@ -325,12 +346,61 @@ class NaijaAgroChat:
             api_key=dot_env_pth.OPENAI_API_KEY,
         )
 
-        # ── Translator LLM (for query/message localization) ─────────────────────
+        # ── Translator LLM ────────────────────────────────────────────────────
         translator_llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
             api_key=dot_env_pth.OPENAI_API_KEY,
         )
 
+        # ── Optional agent (retriever + web search tools) ─────────────────────
+        agent_executor = None
+        if use_agent:
+            # Tools return plain text summaries consumed by the ReAct agent.
+            def _kb_tool(q: str) -> str:
+                docs = retriever.invoke(q)           # use .invoke(), not deprecated .get_relevant_documents()
+                return format_docs(docs) or "No relevant documents found."
+
+            def _web_tool(q: str) -> str:
+                try:
+                    results = web_search(q, num_results=Config.WEB_SEARCH_RESULTS)
+                    return format_search_results(results) or "No web results found."
+                except Exception as e:
+                    return f"Web search failed: {e}"
+
+            tools = [
+                Tool(
+                    name="knowledge_base",
+                    func=_kb_tool,
+                    description=(
+                        "Search the local agricultural knowledge base. "
+                        "Return a concise summary of the most relevant passages."
+                    ),
+                ),
+                Tool(
+                    name="web_search",
+                    func=_web_tool,
+                    description=(
+                        "Search the web for recent information. "
+                        "Return a concise summary of search results."
+                    ),
+                ),
+            ]
+
+            agent_executor = initialize_agent(
+                tools,
+                generator_llm,
+                agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
+                verbose=True,
+                # max_iterations=3,
+                handle_parsing_errors=True,
+            )
+
         logger.info("NaijaAgroChat pipeline ready.")
-        return cls(retriever, generator_llm, safety_llm, translator_llm)
+        return cls(
+            retriever,
+            generator_llm,
+            safety_llm,
+            translator_llm,
+            agent_executor=agent_executor,
+        )

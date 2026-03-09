@@ -18,7 +18,7 @@ st.set_page_config(page_title="NaijaAgroChat", layout="wide")
 
 @st.cache_resource
 def get_bot():
-    return NaijaAgroChat.build(use_openai_generator=True)
+    return NaijaAgroChat.build(use_openai_generator=True, use_agent=True)
 
 
 bot = get_bot()
