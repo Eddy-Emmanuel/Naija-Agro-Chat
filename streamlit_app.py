@@ -190,13 +190,13 @@ def _audio_recorder() -> bytes | None:
 
 
 def _webrtc_recorder() -> bytes | None:
-    """Record audio via streamlit-webrtc and return raw bytes."""
+    """Robust WebRTC audio recorder with TURN fallback for Streamlit Cloud."""
 
     if not HAS_WEBRTC:
-        st.info("Install `streamlit-webrtc` to use the improved recorder. Falling back to the built-in recorder.")
-        return _audio_recorder()
+        st.info("Install `streamlit-webrtc` to use the improved recorder.")
+        return None
 
-    # Create a temp file for the recorded audio; reuse across reruns until consumed.
+    # Reusable temp file
     if "webrtc_tmpfile" not in st.session_state or not st.session_state.webrtc_tmpfile:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
         st.session_state.webrtc_tmpfile = tmp.name
@@ -207,34 +207,50 @@ def _webrtc_recorder() -> bytes | None:
     def _recorder_factory():
         return MediaRecorder(tmp_path, format="wav")
 
+    # Primary: STUN + TURN
     RTC_CONFIGURATION = {
-    "iceServers": [
-        {"urls": ["stun:stun.l.google.com:19302"]},          # STUN server
-        {"urls": ["turn:YOUR_TURN_SERVER:3478"],            # TURN server
-         "username": "user",
-         "credential": "pass"}
-    ]
-}
-    ctx = webrtc_streamer(
-    key="audio_recorder",
-    mode=WebRtcMode.SENDONLY,
-    rtc_configuration=RTC_CONFIGURATION,
-    media_stream_constraints={"audio": True, "video": False},
-    in_recorder_factory=_recorder_factory,
-    audio_receiver_size=256,
-)
+        "iceServers": [
+            {"urls": ["stun:stun.l.google.com:19302"]},
+            {
+                "urls": ["turn:numb.viagenie.ca:3478"],
+                "username": "webrtc@live.com",
+                "credential": "muazkh",
+            },
+        ]
+    }
 
-    # If the stream is still playing, wait for it to stop.
+    try:
+        ctx = webrtc_streamer(
+            key="audio_recorder",
+            mode=WebRtcMode.SENDONLY,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"audio": True, "video": False},
+            in_recorder_factory=_recorder_factory,
+            audio_receiver_size=256,
+        )
+    except Exception:
+        # Fallback: STUN only
+        RTC_CONFIGURATION = {
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        }
+
+        ctx = webrtc_streamer(
+            key="audio_recorder_fallback",
+            mode=WebRtcMode.SENDONLY,
+            rtc_configuration=RTC_CONFIGURATION,
+            media_stream_constraints={"audio": True, "video": False},
+            in_recorder_factory=_recorder_factory,
+            audio_receiver_size=256,
+        )
+
     if ctx.state.playing:
-        st.info("Recording... When you stop, your audio will be processed.")
+        st.info("🎙️ Recording... Click stop when done.")
         return None
 
-    # The recording has stopped; return the captured file contents.
     if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
         with open(tmp_path, "rb") as f:
             data = f.read()
 
-        # Clean up so subsequent recordings create a new file.
         st.session_state.webrtc_tmpfile = None
         try:
             os.remove(tmp_path)

@@ -10,6 +10,8 @@ sentence-transformers==5.2.3
 faiss-cpu==1.13.2
 
 # audio / UI
+av==16.1.0
+aiortc==1.14.0
 streamlit==1.54.0
 streamlit-webrtc==0.64.5
 pydub==0.25.1
