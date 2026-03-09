@@ -208,10 +208,13 @@ def _webrtc_recorder() -> bytes | None:
         return MediaRecorder(tmp_path, format="wav")
 
     RTC_CONFIGURATION = {
-                            "iceServers": [
-                                {"urls": ["stun:stun.l.google.com:19302"]}
-                            ]
-                        }
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},          # STUN server
+        {"urls": ["turn:YOUR_TURN_SERVER:3478"],            # TURN server
+         "username": "user",
+         "credential": "pass"}
+    ]
+}
     ctx = webrtc_streamer(
     key="audio_recorder",
     mode=WebRtcMode.SENDONLY,
