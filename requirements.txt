@@ -11,4 +11,5 @@ streamlit==1.54.0
 streamlit-webrtc==0.64.5
 pydub==0.25.1
 spitch==1.47.0
+PyAudio==0.2.14
 
