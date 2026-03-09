@@ -1,16 +1,44 @@
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from langdetect import DetectorFactory, detect
 from langchain_core.output_parsers import StrOutputParser
 from langchain_openai import ChatOpenAI
 
 from .config import Config, logger
 from .ingestion import load_documents, chunk_documents, build_or_load_vectorstore
 from .retrieval import build_retriever
-from .generation import generation_prompt, format_docs
+from .generation import (
+    generation_prompt,
+    format_docs,
+    translation_prompt,
+    translate_to_query_lang_prompt,
+)
 from .safety import is_safety_critical, verify_safety
 from app.agent.stt import Speech2Text
 from app.agent.tts import Text2Speech
+
+# langdetect is non-deterministic by default; seed it for stable results
+DetectorFactory.seed = 0
+
+SUPPORTED_LANGS = {"en", "yo", "ha", "ig", "pcm"}
+
+
+def detect_language(text: str) -> str:
+    """Naively detect the user language from a text string.
+
+    Falls back to English if detection fails or returns an unsupported code.
+    """
+
+    try:
+        lang = detect(text)
+    except Exception:
+        return "en"
+
+    if lang in SUPPORTED_LANGS:
+        return lang
+    # Some detections may return 'pt' etc. When unsure, fall back to English.
+    return "en"
 
 
 ABSTENTION_MESSAGE = (
@@ -47,16 +75,22 @@ class NaijaAgroChat:
         print(response["answer"])
     """
 
-    def __init__(self, retriever, generator_llm, safety_llm: ChatOpenAI):
+    def __init__(
+        self,
+        retriever,
+        generator_llm,
+        safety_llm: ChatOpenAI,
+        translator_llm: ChatOpenAI,
+    ):
         self.retriever = retriever
         self.generator_llm = generator_llm
         self.safety_llm = safety_llm
+        self.translator_llm = translator_llm
 
     # ── public API ─────────────────────────────────────────────────────────────
 
     def ask(self, query: str) -> dict:
-        """
-        Process a farmer query end-to-end.
+        """Process a farmer query end-to-end.
 
         Returns:
             {
@@ -68,20 +102,29 @@ class NaijaAgroChat:
             }
         """
         logger.info(f"Query: {query}")
+        detected_lang = detect_language(query)
+
+        # 0. Translate non-English queries to English for retrieval (documents are primarily English)
+        query_for_retrieval, translated = self._translate_query_for_retrieval(query)
 
         # 1. Retrieve context ONCE
-        retrieved_docs = self.retriever.invoke(query)
+        retrieved_docs = self.retriever.invoke(query_for_retrieval)
         context_str = format_docs(retrieved_docs)
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
 
         if not retrieved_docs:
             logger.warning("No documents retrieved — abstaining.")
+            message = NO_CONTEXT_MESSAGE
+            if translated:
+                # Return the fallback message in the same language as the query.
+                message = self._localize_message_for_query(message, query)
             return {
                 "query": query,
-                "answer": NO_CONTEXT_MESSAGE,
+                "answer": message,
                 "sources": [],
                 "safety_checked": False,
                 "safe": None,
+                "lang": detected_lang,
             }
 
         # 2. Generate — pass pre-retrieved context directly, no second retrieval
@@ -112,24 +155,72 @@ class NaijaAgroChat:
             "sources": sources,
             "safety_checked": safety_checked,
             "safe": is_safe,
+            "lang": detected_lang,
         }
+
+    def _translate_query_for_retrieval(self, query: str) -> tuple[str, bool]:
+        """Translate the query into English for better retrieval quality.
+
+        Documents in the knowledge base are primarily English, so translating
+        non-English queries improves RAG retrieval.
+
+        Returns:
+            (translated_query, was_translation_performed)
+        """
+        try:
+            translation = (
+                translation_prompt
+                | self.translator_llm
+                | StrOutputParser()
+            ).invoke({"text": query})
+            translation = translation.strip()
+            translated = bool(translation and translation.strip() != query.strip())
+            return (translation or query, translated)
+        except Exception as e:
+            logger.warning(
+                "Query translation failed (using original query): %s", e
+            )
+            return query, False
+
+    def _localize_message_for_query(self, message: str, query: str) -> str:
+        """Translate a fallback message into the language of the original query."""
+        try:
+            localized = (
+                translate_to_query_lang_prompt
+                | self.translator_llm
+                | StrOutputParser()
+            ).invoke({"query": query, "message": message})
+            return localized.strip() or message
+        except Exception as e:
+            logger.warning(
+                "Message localization failed (using original message): %s", e
+            )
+            return message
 
     # ── audio helpers ─────────────────────────────────────────────────────────
 
-    def ask_audio(self, audio_file: str, lang: str = "en") -> Tuple[dict, object]:
+    def ask_audio(self, audio_file: str, lang: str = "auto") -> Tuple[dict, object]:
         """Transcribe audio → RAG query → TTS response.
 
         Returns (result_dict, audio_segment).
         NOTE: STT, RAG, and TTS are deliberately left as separate steps so
         the Streamlit frontend can wrap each in its own spinner/error block.
         """
-        text = Speech2Text(audio_file, lang)
+        # Spitch requires a language code; if user requested auto-detection,
+        # transcribe with English and then detect the actual language from text.
+        stt_lang = "en" if lang == "auto" else lang
+        text = Speech2Text(audio_file, stt_lang)
         result = self.ask(text)
-        audio = Text2Speech(result["answer"], lang)
+
+        # If we autodetected, use detected language for TTS
+        tts_lang = result.get("lang", lang)
+        audio = Text2Speech(result["answer"], tts_lang)
         return result, audio
 
-    def text_to_speech(self, text: str, lang: str = "en"):
+    def text_to_speech(self, text: str, lang: str = "auto"):
         """Generate speech from plain text."""
+        if lang == "auto":
+            lang = detect_language(text)
         return Text2Speech(text, lang)
 
     # ── factory ───────────────────────────────────────────────────────────────
@@ -216,5 +307,12 @@ class NaijaAgroChat:
             api_key=dot_env_pth.OPENAI_API_KEY,
         )
 
+        # ── Translator LLM (for query/message localization) ─────────────────────
+        translator_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0,
+            api_key=dot_env_pth.OPENAI_API_KEY,
+        )
+
         logger.info("NaijaAgroChat pipeline ready.")
-        return cls(retriever, generator_llm, safety_llm)
+        return cls(retriever, generator_llm, safety_llm, translator_llm)

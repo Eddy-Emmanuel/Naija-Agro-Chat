@@ -15,9 +15,15 @@ LANG_VOICE_MAP = {
     "ig":  "obinna",
     "pcm": "ufoma",
 }
+DEFAULT_VOICE = "john"
 
 def Text2Speech(txt: str, lang: str = "en") -> AudioSegment:
-    voice = LANG_VOICE_MAP[lang]
+    # A lot of callers may use 'auto' or an unsupported locale.
+    # Fall back to English voice if we don't know what to use.
+    voice = LANG_VOICE_MAP.get(lang, DEFAULT_VOICE)
+    if lang not in LANG_VOICE_MAP:
+        logger.debug(f"Unknown TTS lang '{lang}' — falling back to {DEFAULT_VOICE}")
+
     logger.info(f"TTS | lang={lang}, voice={voice}, chars={len(txt)}")
     response = client.speech.generate(
         language=lang,

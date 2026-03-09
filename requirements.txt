@@ -4,9 +4,11 @@ pydantic==2.12.5
 langchain-community==0.4.1
 pydantic-settings==2.13.1
 langchain-openai==1.1.10
+langdetect==1.0.9
 
 # audio / UI
-streamlit
-pydub
-spitch
+streamlit==1.54.0
+streamlit-webrtc==0.64.5
+pydub==0.25.1
+spitch==1.47.0
 
