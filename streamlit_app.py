@@ -207,14 +207,19 @@ def _webrtc_recorder() -> bytes | None:
     def _recorder_factory():
         return MediaRecorder(tmp_path, format="wav")
 
+    RTC_CONFIGURATION = {
+                            "iceServers": [
+                                {"urls": ["stun:stun.l.google.com:19302"]}
+                            ]
+                        }
     ctx = webrtc_streamer(
-        key="audio_recorder",
-        mode=WebRtcMode.SENDONLY,
-        media_stream_constraints={"audio": True, "video": False},
-        in_recorder_factory=_recorder_factory,
-        audio_receiver_size=256,
-        async_processing=True,
-    )
+    key="audio_recorder",
+    mode=WebRtcMode.SENDONLY,
+    rtc_configuration=RTC_CONFIGURATION,
+    media_stream_constraints={"audio": True, "video": False},
+    in_recorder_factory=_recorder_factory,
+    audio_receiver_size=256,
+)
 
     # If the stream is still playing, wait for it to stop.
     if ctx.state.playing:
