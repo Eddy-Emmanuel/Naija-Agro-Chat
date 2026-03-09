@@ -38,3 +38,7 @@ class Config:
         "dosage", "dose", "chemical", "spray", "litre", "liter",
         "ml", "gram", "kg", "application rate",
     ]
+
+    # Web search fallback (requires SERPAPI_API_KEY in .env)
+    USE_WEB_SEARCH: bool = True
+    WEB_SEARCH_RESULTS: int = 5

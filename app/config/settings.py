@@ -6,5 +6,6 @@ class EnV(BaseSettings):
     OPENAI_API_KEY:str
     SPITCH_API_KEY:str
     HUGGINGFACE_API_KEY:str
+    SERPAPI_API_KEY:str
 
 dot_env_pth = EnV()

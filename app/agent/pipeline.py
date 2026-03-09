@@ -15,6 +15,7 @@ from .generation import (
     translate_to_query_lang_prompt,
 )
 from .safety import is_safety_critical, verify_safety
+from .web_search import format_search_results, web_search
 from app.agent.stt import Speech2Text
 from app.agent.tts import Text2Speech
 
@@ -113,19 +114,36 @@ class NaijaAgroChat:
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
 
         if not retrieved_docs:
-            logger.warning("No documents retrieved — abstaining.")
-            message = NO_CONTEXT_MESSAGE
-            if translated:
-                # Return the fallback message in the same language as the query.
-                message = self._localize_message_for_query(message, query)
-            return {
-                "query": query,
-                "answer": message,
-                "sources": [],
-                "safety_checked": False,
-                "safe": None,
-                "lang": detected_lang,
-            }
+            logger.warning("No documents retrieved — trying web search fallback.")
+
+            # If the knowledge base has nothing, optionally fall back to live web search.
+            if Config.USE_WEB_SEARCH:
+                try:
+                    web_results = web_search(
+                        query_for_retrieval, num_results=Config.WEB_SEARCH_RESULTS
+                    )
+                except Exception as e:
+                    logger.warning(f"Web search failed: {e}")
+                    web_results = []
+
+                if web_results:
+                    context_str = format_search_results(web_results)
+                    sources = [r.get("link", "unknown") for r in web_results]
+
+            if not context_str:
+                # Still no useful context – respond with a safe fallback message.
+                message = NO_CONTEXT_MESSAGE
+                if translated:
+                    # Return the fallback message in the same language as the query.
+                    message = self._localize_message_for_query(message, query)
+                return {
+                    "query": query,
+                    "answer": message,
+                    "sources": [],
+                    "safety_checked": False,
+                    "safe": None,
+                    "lang": detected_lang,
+                }
 
         # 2. Generate — pass pre-retrieved context directly, no second retrieval
         try:
