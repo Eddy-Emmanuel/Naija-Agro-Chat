@@ -14,6 +14,8 @@ from .generation import (
     format_docs,
     translation_prompt,
     translate_to_query_lang_prompt,
+    GENERATION_SYSTEM,
+    AGENT_SYSTEM,
 )
 from .safety import is_safety_critical, verify_safety
 from .web_search import format_search_results, web_search
@@ -66,9 +68,8 @@ LANG_VOICE_MAP = {
 DEFAULT_VOICE = "tunde"
 
 # ── Agent / tool imports ──────────────────────────────────────────────────────
-from langchain_core.tools import Tool                                  
-from langchain_classic.agents.agent_types import AgentType
-from langchain_classic.agents.initialize import initialize_agent
+from langchain_core.tools import tool as lc_tool
+from langgraph.prebuilt import create_react_agent
 
 
 class NaijaAgroChat:
@@ -100,6 +101,9 @@ class NaijaAgroChat:
     def ask(self, query: str) -> dict:
         """Process a farmer query end-to-end.
 
+        When use_agent=True the agent_executor handles retrieval, web search,
+        and generation entirely on its own — the manual pipeline is skipped.
+
         Returns:
             {
                 "query": str,
@@ -112,23 +116,29 @@ class NaijaAgroChat:
         """
         logger.info(f"Query: {query}")
         detected_lang = detect_language(query)
-
-        # Include the current date so the model can reason about time-sensitive matters.
         current_date = datetime.now().astimezone().isoformat()
 
-        # 0. First try to answer directly (without invoking retrieval/web tools) so we
-        #    don't call external tools for questions the model can answer on its own.
-        direct_answer = self._try_answer_without_tools(query, current_date)
-        if direct_answer is not None:
-            answer = direct_answer
-            sources = []
-            context_for_safety = ""
-            # Safety check still applies if the query is safety-critical.
+        # ── Agent path ────────────────────────────────────────────────────────
+        # When an agent_executor is present it owns retrieval + generation.
+        # The manual pipeline below is only used in non-agent mode.
+        if self.agent_executor:
+            logger.info("Using agent executor for query.")
+            from langchain_core.messages import HumanMessage, SystemMessage
+            result = self.agent_executor.invoke({
+                "messages": [
+                    SystemMessage(content=f"The current date is {current_date}. "
+                                          "Always respond in the SAME language the user used."),
+                    HumanMessage(content=query),
+                ]
+            })
+            answer = result["messages"][-1].content
+
+            # Safety check still applies for chemical/dosage queries
             safety_checked = False
             is_safe: Optional[bool] = None
             if is_safety_critical(query):
                 safety_checked = True
-                is_safe, reason = verify_safety(query, answer, context_for_safety, self.safety_llm)
+                is_safe, reason = verify_safety(query, answer, "", self.safety_llm)
                 logger.info(f"Safety check — safe={is_safe}, reason={reason}")
                 if not is_safe:
                     answer = ABSTENTION_MESSAGE
@@ -136,23 +146,22 @@ class NaijaAgroChat:
             return {
                 "query": query,
                 "answer": answer,
-                "sources": sources,
+                "sources": [],
                 "safety_checked": safety_checked,
                 "safe": is_safe,
                 "lang": detected_lang,
             }
 
+        # ── Manual pipeline (no agent) ────────────────────────────────────────
+
         # 1. Translate non-English queries to English for retrieval
-        #    (documents are primarily English)
         query_for_retrieval, translated = self._translate_query_for_retrieval(query)
 
-        # 2. Retrieve context ONCE
+        # 2. Retrieve context
         retrieved_docs = self.retriever.invoke(query_for_retrieval)
         context_str = format_docs(retrieved_docs)
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
 
-        # If the index is empty, the build step may insert a placeholder doc.
-        # Treat that as "no context" so web search can act as a fallback.
         no_docs = (
             not retrieved_docs
             or all(d.metadata.get("source") == "placeholder" for d in retrieved_docs)
@@ -176,7 +185,39 @@ class NaijaAgroChat:
                     sources = [r.get("link", "unknown") for r in web_results]
 
             if not context_str:
-                # Still no useful context — respond with a safe fallback message.
+                try:
+                    from .generation import general_generation_prompt
+                    answer = (
+                        general_generation_prompt
+                        | self.generator_llm
+                        | StrOutputParser()
+                    ).invoke({
+                        "question": query,
+                        "context": "",
+                        "current_date": current_date,
+                    })
+                except Exception as e:
+                    logger.error(f"Direct generation fallback failed: {e}")
+                    answer = None
+
+                if answer:
+                    safety_checked = False
+                    is_safe = None
+                    if is_safety_critical(query):
+                        safety_checked = True
+                        is_safe, reason = verify_safety(query, answer, "", self.safety_llm)
+                        logger.info(f"Safety check — safe={is_safe}, reason={reason}")
+                        if not is_safe:
+                            answer = ABSTENTION_MESSAGE
+                    return {
+                        "query": query,
+                        "answer": answer,
+                        "sources": [],
+                        "safety_checked": safety_checked,
+                        "safe": is_safe,
+                        "lang": detected_lang,
+                    }
+
                 message = NO_CONTEXT_MESSAGE
                 if translated:
                     message = self._localize_message_for_query(message, query)
@@ -189,35 +230,23 @@ class NaijaAgroChat:
                     "lang": detected_lang,
                 }
 
-        # If we have an agent_executor (tool-based agent), let it handle
-        # retrieval + generation.
-        if self.agent_executor:
-            logger.info("Using agent executor for query.")
-            # Include the current date so the model can reason about time-sensitive matters.
-            answer = self.agent_executor.run(
-                f"Current date: {current_date}\n\n{query}"
-            )
-            context_for_safety = ""  # agent tools are opaque here
-        else:
-            # 2. Generate — pass pre-retrieved context directly
-            try:
-                answer = (
-                    generation_prompt
-                    | self.generator_llm
-                    | StrOutputParser()
-                ).invoke(
-                    {
-                        "question": query,
-                        "context": context_str,
-                        "current_date": current_date,
-                    }
-                )
-            except Exception as e:
-                logger.error(f"Generation failed: {e}")
-                raise
-            context_for_safety = context_str
+        # 3. Generate from retrieved context
+        try:
+            answer = (
+                generation_prompt
+                | self.generator_llm
+                | StrOutputParser()
+            ).invoke({
+                "question": query,
+                "context": context_str,
+                "current_date": current_date,
+            })
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            raise
+        context_for_safety = context_str
 
-        # 3. Safety check (only for safety-critical queries)
+        # 4. Safety check
         safety_checked = False
         is_safe: Optional[bool] = None
 
@@ -236,49 +265,6 @@ class NaijaAgroChat:
             "safe": is_safe,
             "lang": detected_lang,
         }
-
-    def _try_answer_without_tools(self, query: str, current_date: str) -> Optional[str]:
-        """Try to answer without retrieving context or calling web tools.
-
-        Returns a non-empty answer only if the model appears confident.
-        """
-        try:
-            answer = (
-                generation_prompt
-                | self.generator_llm
-                | StrOutputParser()
-            ).invoke({
-                "question": query,
-                "context": "",
-                "current_date": current_date,
-            })
-        except Exception as e:
-            logger.warning("Direct answer attempt failed: %s", e)
-            return None
-
-        if not answer:
-            return None
-
-        lower = answer.strip().lower()
-        # If the model indicates it can't answer without context, treat as unknown.
-        for phrase in [
-            "i don't have",
-            "i dont have",
-            "i don't know",
-            "i dont know",
-            "i'm not sure",
-            "im not sure",
-            "no information",
-            "no relevant",
-            "i cannot",
-            "i cant",
-            "i can't",
-            "i don't have enough",
-        ]:
-            if phrase in lower:
-                return None
-
-        return answer
 
     def _translate_query_for_retrieval(self, query: str) -> tuple[str, bool]:
         """Translate the query into English for better retrieval quality.
@@ -385,9 +371,9 @@ class NaijaAgroChat:
         # Resolve key once — never pass None to ChatOpenAI
         os.environ["OPENAI_API_KEY"] = dot_env_pth.OPENAI_API_KEY
 
-        logger.info("Using OpenAI GPT-4o-mini as generator.")
+        logger.info("Using OpenAI gpt-5.4 as generator.")
         generator_llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-5.4",
             temperature=0.1,
             api_key=dot_env_pth.OPENAI_API_KEY,
         )
@@ -401,7 +387,7 @@ class NaijaAgroChat:
 
         # ── Translator LLM ────────────────────────────────────────────────────
         translator_llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model="gpt-5.4",
             temperature=0,
             api_key=dot_env_pth.OPENAI_API_KEY,
         )
@@ -409,44 +395,28 @@ class NaijaAgroChat:
         # ── Optional agent (retriever + web search tools) ─────────────────────
         agent_executor = None
         if use_agent:
-            # Tools return plain text summaries consumed by the ReAct agent.
-            def _kb_tool(q: str) -> str:
-                docs = retriever.invoke(q)           # use .invoke(), not deprecated .get_relevant_documents()
+            # Tools decorated with @lc_tool so the LLM can call them by name.
+            @lc_tool
+            def knowledge_base(query: str) -> str:
+                """Search the local agricultural knowledge base for relevant passages."""
+                docs = retriever.invoke(query)
                 return format_docs(docs) or "No relevant documents found."
 
-            def _web_tool(q: str) -> str:
+            @lc_tool
+            def web_search_tool(query: str) -> str:
+                """Search the web for recent agricultural information."""
                 try:
-                    results = web_search(q, num_results=Config.WEB_SEARCH_RESULTS)
+                    results = web_search(query, num_results=Config.WEB_SEARCH_RESULTS)
                     return format_search_results(results) or "No web results found."
                 except Exception as e:
                     return f"Web search failed: {e}"
 
-            tools = [
-                Tool(
-                    name="knowledge_base",
-                    func=_kb_tool,
-                    description=(
-                        "Search the local agricultural knowledge base. "
-                        "Return a concise summary of the most relevant passages."
-                    ),
-                ),
-                Tool(
-                    name="web_search",
-                    func=_web_tool,
-                    description=(
-                        "Search the web for recent information. "
-                        "Return a concise summary of search results."
-                    ),
-                ),
-            ]
+            tools = [knowledge_base, web_search_tool]
 
-            agent_executor = initialize_agent(
-                tools,
-                generator_llm,
-                agent=AgentType.CHAT_ZERO_SHOT_REACT_DESCRIPTION,
-                verbose=True,
-                # max_iterations=3,
-                handle_parsing_errors=True,
+            agent_executor = create_react_agent(
+                model=generator_llm,
+                tools=tools,
+                prompt=AGENT_SYSTEM,
             )
 
         logger.info("NaijaAgroChat pipeline ready.")
