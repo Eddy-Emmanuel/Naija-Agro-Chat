@@ -98,8 +98,11 @@ class NaijaAgroChat:
 
     # ── public API ─────────────────────────────────────────────────────────────
 
-    def ask(self, query: str) -> dict:
+    def ask(self, query: str, history: Optional[list[dict]] = None) -> dict:
         """Process a farmer query end-to-end.
+
+        The bot can optionally use prior conversation history to answer follow-up
+        questions more effectively.
 
         When use_agent=True the agent_executor handles retrieval, web search,
         and generation entirely on its own — the manual pipeline is skipped.
@@ -114,6 +117,29 @@ class NaijaAgroChat:
                 "lang": str,
             }
         """
+        history = history or []
+
+        def _format_history(hist: list[dict], max_items: int = 6) -> str:
+            """Serialize a short conversation history for prompt context."""
+            if not hist:
+                return ""
+
+            # Keep only the most recent turns to avoid overly long prompts.
+            clipped = hist[-max_items:]
+            lines = []
+            for msg in clipped:
+                role = (msg.get("role") or "").lower()
+                content = msg.get("content", "")
+                if role == "user":
+                    lines.append(f"User: {content}")
+                elif role == "assistant":
+                    lines.append(f"Assistant: {content}")
+                else:
+                    lines.append(f"{role.capitalize()}: {content}")
+            return "\n".join(lines)
+
+        history_str = _format_history(history)
+
         logger.info(f"Query: {query}")
         detected_lang = detect_language(query)
         current_date = datetime.now().astimezone().isoformat()
@@ -123,14 +149,25 @@ class NaijaAgroChat:
         # The manual pipeline below is only used in non-agent mode.
         if self.agent_executor:
             logger.info("Using agent executor for query.")
-            from langchain_core.messages import HumanMessage, SystemMessage
-            result = self.agent_executor.invoke({
-                "messages": [
-                    SystemMessage(content=f"The current date is {current_date}. "
-                                          "Always respond in the SAME language the user used."),
-                    HumanMessage(content=query),
-                ]
-            })
+            from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+
+            # Include a short slice of the recent conversation history so follow-up
+            # questions can be answered in context.
+            messages = [
+                SystemMessage(content=f"The current date is {current_date}. "
+                                      "Always respond in the SAME language the user used."),
+            ]
+            for msg in history[-6:]:
+                role = (msg.get("role") or "").lower()
+                content = msg.get("content", "")
+                if role == "user":
+                    messages.append(HumanMessage(content=content))
+                elif role == "assistant":
+                    messages.append(AIMessage(content=content))
+
+            messages.append(HumanMessage(content=query))
+
+            result = self.agent_executor.invoke({"messages": messages})
             answer = result["messages"][-1].content
 
             # Safety check still applies for chemical/dosage queries
@@ -194,6 +231,7 @@ class NaijaAgroChat:
                     ).invoke({
                         "question": query,
                         "context": "",
+                        "history": history_str,
                         "current_date": current_date,
                     })
                 except Exception as e:
@@ -239,6 +277,7 @@ class NaijaAgroChat:
             ).invoke({
                 "question": query,
                 "context": context_str,
+                "history": history_str,
                 "current_date": current_date,
             })
         except Exception as e:
@@ -307,7 +346,12 @@ class NaijaAgroChat:
 
     # ── audio helpers ─────────────────────────────────────────────────────────
 
-    def ask_audio(self, audio_file: str, lang: str = "auto") -> Tuple[dict, None]:
+    def ask_audio(
+        self,
+        audio_file: str,
+        lang: str = "auto",
+        history: Optional[list[dict]] = None,
+    ) -> Tuple[dict, None]:
         """Transcribe audio → RAG query.
 
         Returns (result_dict, None).
@@ -319,7 +363,7 @@ class NaijaAgroChat:
         # transcribe with English and then detect the actual language from text.
         stt_lang = "en" if lang == "auto" else lang
         text = Speech2Text(audio_file, stt_lang)
-        result = self.ask(text)
+        result = self.ask(text, history=history)
         # TTS is intentionally NOT called here — app.py calls text_to_speech()
         # separately to avoid a double TTS round-trip.
         return result, None

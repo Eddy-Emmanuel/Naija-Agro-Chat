@@ -20,7 +20,10 @@ Rules:
 - Be concise and practical — farmers need actionable advice.
 """
 
-GENERATION_HUMAN = """Context:
+GENERATION_HUMAN = """History:
+{history}
+
+Context:
 {context}
 
 Question: {question}

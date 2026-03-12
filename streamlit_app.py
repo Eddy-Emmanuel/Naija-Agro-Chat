@@ -83,11 +83,13 @@ def _audio_bytes_to_wav(audio_bytes: bytes, src_format: str = "wav") -> str:
 
 def _run_query(query: str):
     """Run a text query through the bot and append results to chat history."""
+    # Pass prior conversation to the bot so it can handle follow-up questions.
+    history = st.session_state.chat_history.copy()
     _append_message("user", query)
 
     with st.spinner("Retrieving & generating answer..."):
         try:
-            result = bot.ask(query)
+            result = bot.ask(query, history=history)
         except Exception as exc:
             st.error(f"Pipeline error: {exc}")
             return
@@ -123,7 +125,11 @@ def _transcribe_audio(audio_bytes: bytes, src_format: str = "wav") -> str | None
 
     with st.spinner("Transcribing audio..."):
         try:
-            result, _ = bot.ask_audio(wav_path, lang="auto")
+            result, _ = bot.ask_audio(
+                wav_path,
+                lang="auto",
+                history=st.session_state.chat_history.copy(),
+            )
         except Exception as exc:
             st.error(f"Transcription failed: {exc}")
             return None
