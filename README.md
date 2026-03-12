@@ -96,6 +96,8 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 
 ## 🔍 Architecture Overview
 
+![Architecture diagram](architecture.svg)
+
 1. **User Input**  
    - Streamlit captures text or audio.  
    - Audio is converted via `stt.py`.
