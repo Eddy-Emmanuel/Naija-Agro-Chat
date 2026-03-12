@@ -9,9 +9,10 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 
 - **Speech‑to‑Text (STT)** for capturing user queries verbally.
 - **Text Generation** using an LLM to answer agricultural questions (passes the current date so the model can reason about time-sensitive items).
-- **Direct-answer optimization**: the system first attempts to answer questions without calling retrieval or web tools when it can.
-- **Retrieval Pipeline** that searches a FAISS index built from domain knowledge.
-- **Safety checks and moderation** to filter inappropriate inputs.
+- **Agentic reasoning (tools + retrieval)**: an optional LangChain agent decides whether to answer directly or call tools like the knowledge base (FAISS) and a web search.
+- **Conversation memory**: chat history is stored in the session and included in prompts for better follow‑ups.
+- **Multilingual support**: detects query language, translates non‑English queries for retrieval, and keeps answers in the user’s language.
+- **Safety checks and moderation** to filter inappropriate or unsafe inputs.
 - **Text‑to‑Speech (TTS)** to read responses aloud.
 - **Streamlit UI** for web‑based interaction.
 
@@ -98,29 +99,46 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 
 ![Architecture diagram](architecture.svg)
 
-1. **User Input**  
-   - Streamlit captures text or audio.  
-   - Audio is converted via `stt.py`.
+### 1) Frontend & Session Memory
+- `streamlit_app.py` manages the UI and keeps a short **conversation history** in `st.session_state.chat_history`. This history is passed into the pipeline so follow-up questions can be answered in context.
+- Users can input via **text** or **voice** (microphone upload).
 
-2. **Safety Check**  
-   - `safety.py` inspects input for harmful content.
+### 2) Speech‑to‑Text (STT)
+- Audio inputs are handled by `app/agent/stt.py` (Spitch) to transcribe spoken queries into text.
+- The detected language drives later localization decisions.
 
-3. **Retrieval**  
-   - `retrieval.py` searches the FAISS index for relevant passages.
+### 3) Input Safety Screening
+- Inputs that may involve chemicals/dosages are checked with `app/agent/safety.py` and a dedicated safety LLM (`Config.OPENAI_SAFETY_MODEL`).
+- If unsafe content is detected, the system abstains with a safe fallback message.
 
-4. **Generation**  
-   - `generation.py` formats prompts combining query + retrieved context and includes the current date so the model can reason about time-sensitive matters.  
-   - The pipeline first tries to answer directly (without retrieval or web tools) for straightforward questions.  
-   - Sends to LLM (e.g. OpenAI GPT) and receives response.
+### 4) Language Handling & Retrieval
+- Non-English queries are translated into English for better retrieval quality.
+- `app/agent/retrieval.py` searches the FAISS vector index (`faiss_index/index.faiss`) to find relevant passages from the knowledge base.
+- If no documents are found, the system can optionally fall back to **web search** (`app/agent/web_search.py`) to gather recent information.
 
-5. **Post‑processing & Safety**  
-   - Output is filtered again before being shown.
+### 5) Agentic Mode (Tool‑Enabled Reasoning)
+- When enabled via `NaijaAgroChat.build(use_agent=True)`, the system runs a **LangChain React agent** that can decide whether to:
+  - Answer directly
+  - Call the **knowledge base tool** (retrieval over FAISS)
+  - Call the **web search tool** (live search results)
+- The agent receives a short slice of recent conversation history and is expected to keep replies in the same language as the user.
 
-6. **Text‑to‑Speech**  
-   - `tts.py` converts the textual answer to audio.
+### 6) Response Generation
+- Prompts are assembled in `app/agent/generation.py`, combining:
+  - the user query
+  - retrieved context or tool outputs
+  - recent conversation history
+  - the current date (so time-sensitive reasoning works)
+- The generator uses an LLM (e.g., OpenAI GPT via `langchain_openai.ChatOpenAI`).
 
-7. **Frontend**  
-   - `streamlit_app.py` glues together the above modules into an interactive experience.
+### 7) Post‑processing & Output Safety
+- Generated answers are re-checked by `app/agent/safety.py` when queries are potentially dangerous.
+- Safe responses are returned to the frontend along with source citations.
+
+### 8) Text‑to‑Speech (TTS)
+- `app/agent/tts.py` converts final answers into speech audio (Spitch), using a language-appropriate voice.
+
+---
 
 ---
 
