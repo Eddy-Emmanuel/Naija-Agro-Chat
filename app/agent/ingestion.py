@@ -4,8 +4,7 @@ from typing import List, Optional
 from langchain_core.documents import Document
 from langchain_community.document_loaders import (
     PyPDFLoader,
-    DirectoryLoader,
-    TextLoader,
+    DirectoryLoader
 )
 
 from .config import Config, logger

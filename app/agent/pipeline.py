@@ -1,5 +1,6 @@
+from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 from langdetect import DetectorFactory, detect
 from langchain_core.output_parsers import StrOutputParser
@@ -112,11 +113,40 @@ class NaijaAgroChat:
         logger.info(f"Query: {query}")
         detected_lang = detect_language(query)
 
-        # 0. Translate non-English queries to English for retrieval
+        # Include the current date so the model can reason about time-sensitive matters.
+        current_date = datetime.now().astimezone().isoformat()
+
+        # 0. First try to answer directly (without invoking retrieval/web tools) so we
+        #    don't call external tools for questions the model can answer on its own.
+        direct_answer = self._try_answer_without_tools(query, current_date)
+        if direct_answer is not None:
+            answer = direct_answer
+            sources = []
+            context_for_safety = ""
+            # Safety check still applies if the query is safety-critical.
+            safety_checked = False
+            is_safe: Optional[bool] = None
+            if is_safety_critical(query):
+                safety_checked = True
+                is_safe, reason = verify_safety(query, answer, context_for_safety, self.safety_llm)
+                logger.info(f"Safety check — safe={is_safe}, reason={reason}")
+                if not is_safe:
+                    answer = ABSTENTION_MESSAGE
+
+            return {
+                "query": query,
+                "answer": answer,
+                "sources": sources,
+                "safety_checked": safety_checked,
+                "safe": is_safe,
+                "lang": detected_lang,
+            }
+
+        # 1. Translate non-English queries to English for retrieval
         #    (documents are primarily English)
         query_for_retrieval, translated = self._translate_query_for_retrieval(query)
 
-        # 1. Retrieve context ONCE
+        # 2. Retrieve context ONCE
         retrieved_docs = self.retriever.invoke(query_for_retrieval)
         context_str = format_docs(retrieved_docs)
         sources = list({d.metadata.get("source", "unknown") for d in retrieved_docs})
@@ -163,7 +193,10 @@ class NaijaAgroChat:
         # retrieval + generation.
         if self.agent_executor:
             logger.info("Using agent executor for query.")
-            answer = self.agent_executor.run(query)
+            # Include the current date so the model can reason about time-sensitive matters.
+            answer = self.agent_executor.run(
+                f"Current date: {current_date}\n\n{query}"
+            )
             context_for_safety = ""  # agent tools are opaque here
         else:
             # 2. Generate — pass pre-retrieved context directly
@@ -172,7 +205,13 @@ class NaijaAgroChat:
                     generation_prompt
                     | self.generator_llm
                     | StrOutputParser()
-                ).invoke({"question": query, "context": context_str})
+                ).invoke(
+                    {
+                        "question": query,
+                        "context": context_str,
+                        "current_date": current_date,
+                    }
+                )
             except Exception as e:
                 logger.error(f"Generation failed: {e}")
                 raise
@@ -197,6 +236,49 @@ class NaijaAgroChat:
             "safe": is_safe,
             "lang": detected_lang,
         }
+
+    def _try_answer_without_tools(self, query: str, current_date: str) -> Optional[str]:
+        """Try to answer without retrieving context or calling web tools.
+
+        Returns a non-empty answer only if the model appears confident.
+        """
+        try:
+            answer = (
+                generation_prompt
+                | self.generator_llm
+                | StrOutputParser()
+            ).invoke({
+                "question": query,
+                "context": "",
+                "current_date": current_date,
+            })
+        except Exception as e:
+            logger.warning("Direct answer attempt failed: %s", e)
+            return None
+
+        if not answer:
+            return None
+
+        lower = answer.strip().lower()
+        # If the model indicates it can't answer without context, treat as unknown.
+        for phrase in [
+            "i don't have",
+            "i dont have",
+            "i don't know",
+            "i dont know",
+            "i'm not sure",
+            "im not sure",
+            "no information",
+            "no relevant",
+            "i cannot",
+            "i cant",
+            "i can't",
+            "i don't have enough",
+        ]:
+            if phrase in lower:
+                return None
+
+        return answer
 
     def _translate_query_for_retrieval(self, query: str) -> tuple[str, bool]:
         """Translate the query into English for better retrieval quality.
@@ -269,8 +351,6 @@ class NaijaAgroChat:
         cls,
         docs_dir: Optional[str] = None,
         force_rebuild_index: bool = False,
-        openai_api_key: Optional[str] = None,
-        use_openai_generator: bool = False,
         use_agent: bool = False,
     ) -> "NaijaAgroChat":
 
@@ -305,39 +385,12 @@ class NaijaAgroChat:
         # Resolve key once — never pass None to ChatOpenAI
         os.environ["OPENAI_API_KEY"] = dot_env_pth.OPENAI_API_KEY
 
-        if use_openai_generator:
-            logger.info("Using OpenAI GPT-4o-mini as generator.")
-            generator_llm = ChatOpenAI(
-                model="gpt-4o-mini",
-                temperature=0.1,
-                api_key=dot_env_pth.OPENAI_API_KEY,
-            )
-        else:
-            logger.info(f"Loading local generator: {Config.GENERATOR_MODEL}")
-            from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
-            from transformers import logging as hf_logging
-            hf_logging.set_verbosity_error()
-            import torch
-
-            tokenizer = AutoTokenizer.from_pretrained(
-                Config.GENERATOR_MODEL, token=dot_env_pth.HUGGINGFACE_API_KEY
-            )
-            model = AutoModelForCausalLM.from_pretrained(
-                Config.GENERATOR_MODEL,
-                token=dot_env_pth.HUGGINGFACE_API_KEY,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto",
-            )
-            pipe = pipeline(
-                "text-generation",
-                model=model,
-                tokenizer=tokenizer,
-                max_new_tokens=Config.MAX_NEW_TOKENS,
-                max_length=Config.MAX_TOTAL_TOKENS,
-                do_sample=False,
-            )
-            from langchain_huggingface import HuggingFacePipeline
-            generator_llm = HuggingFacePipeline(pipeline=pipe)
+        logger.info("Using OpenAI GPT-4o-mini as generator.")
+        generator_llm = ChatOpenAI(
+            model="gpt-4o-mini",
+            temperature=0.1,
+            api_key=dot_env_pth.OPENAI_API_KEY,
+        )
 
         # ── Safety LLM ────────────────────────────────────────────────────────
         safety_llm = ChatOpenAI(

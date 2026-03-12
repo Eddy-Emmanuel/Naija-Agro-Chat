@@ -8,7 +8,8 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 ## 📌 Features
 
 - **Speech‑to‑Text (STT)** for capturing user queries verbally.
-- **Text Generation** using an LLM to answer agricultural questions.
+- **Text Generation** using an LLM to answer agricultural questions (passes the current date so the model can reason about time-sensitive items).
+- **Direct-answer optimization**: the system first attempts to answer questions without calling retrieval or web tools when it can.
 - **Retrieval Pipeline** that searches a FAISS index built from domain knowledge.
 - **Safety checks and moderation** to filter inappropriate inputs.
 - **Text‑to‑Speech (TTS)** to read responses aloud.
@@ -106,7 +107,8 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
    - `retrieval.py` searches the FAISS index for relevant passages.
 
 4. **Generation**  
-   - `generation.py` formats prompts combining query + retrieved context.  
+   - `generation.py` formats prompts combining query + retrieved context and includes the current date so the model can reason about time-sensitive matters.  
+   - The pipeline first tries to answer directly (without retrieval or web tools) for straightforward questions.  
    - Sends to LLM (e.g. OpenAI GPT) and receives response.
 
 5. **Post‑processing & Safety**  
