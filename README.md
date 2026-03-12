@@ -97,7 +97,7 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 
 ## 🔍 Architecture Overview
 
-![Architecture diagram](architecture.svg)
+![Architecture diagram](architecture.png)
 
 ### 1) Frontend & Session Memory
 - `streamlit_app.py` manages the UI and keeps a short **conversation history** in `st.session_state.chat_history`. This history is passed into the pipeline so follow-up questions can be answered in context.
