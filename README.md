@@ -80,7 +80,7 @@ This project integrates speech‑to‑text, text generation, retrieval over doma
 6. **Run the app**
 
    ```bash
-   streamlit run app/streamlit_app.py
+   python -m streamlit run streamlit_app.py
    ```
 
    The UI will be served locally (usually at `http://localhost:8501`).
