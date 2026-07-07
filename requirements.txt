@@ -3,6 +3,7 @@ langgraph==1.0.5
 langgraph-prebuilt==1.0.5
 langgraph-checkpoint==3.0.1
 langchain==1.2.10
+langchain-core==1.2.5
 elevenlabs==2.37.0
 pydantic==2.12.5
 langchain-community==0.4.1
@@ -22,4 +23,3 @@ streamlit-webrtc==0.64.5
 pydub==0.25.1
 spitch==1.47.0
 PyAudio==0.2.14
-
