@@ -1,4 +1,7 @@
 torchvision==0.27
+langgraph==0.2.60
+langgraph-checkpoint==2.0.9
+langgraph-prebuilt==0.1.8
 langchain==1.2.10
 elevenlabs==2.37.0
 pydantic==2.12.5
